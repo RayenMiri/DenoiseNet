@@ -1,110 +1,129 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import os
-import numpy as np
-import tensorflow as tf
-from denoisnet_model import denoisnet_model
 import librosa
-from sklearn.model_selection import train_test_split
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from denoisnet_model import DenoisNet
 
-# Parameters
-SAMPLE_RATE = 16000  # Audio sample rate
-N_FFT = 512          # STFT window size
-HOP_LENGTH = 128     # STFT hop length
-EPOCHS = 50          # Number of training epochs
-BATCH_SIZE = 32      # Batch size
-INPUT_SHAPE = (None, N_FFT // 2 + 1)  # Input shape for U-Net (time_steps, n_features)
+class AudioDataset(Dataset):
+    def __init__(self, clean_files, noise_files, transform=None, target_length=None):
+        self.clean_files = clean_files
+        self.noise_files = noise_files
+        self.transform = transform
+        self.target_length = target_length  # Target length for all audio files
 
-def load_audio(file_path, sr=SAMPLE_RATE):
-    audio, _ = librosa.load(file_path, sr=sr)
-    return audio
+    def __len__(self):
+        return len(self.clean_files)
 
-def audio_to_spectrogram(audio, n_fft=N_FFT, hop_length=HOP_LENGTH):
-    stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
-    spectrogram = np.abs(stft)
-    return spectrogram
+    def __getitem__(self, idx):
+        clean_file = self.clean_files[idx]
+        noise_file = self.noise_files[idx % len(self.noise_files)]  # Use modulo to loop through noise files
 
-def spectrogram_to_audio(spectrogram, hop_length=HOP_LENGTH):
-    phase = np.exp(1j * np.angle(librosa.stft(audio, n_fft=N_FFT, hop_length=hop_length)))
-    audio = librosa.istft(spectrogram * phase, hop_length=hop_length)
-    return audio
+        # Load audio data (waveform)
+        clean_audio, sr = librosa.load(clean_file, sr=None)
+        noise_audio, _ = librosa.load(noise_file, sr=None)
 
-def prepare_dataset(clean_files, noise_files, snr=5, fixed_length=128):
-    X, y = [], []
-    print(len(noise_files))
-    for clean_file in clean_files:
-        clean_audio = load_audio(clean_file)
-        noise_audio = load_audio(np.random.choice(noise_files))
-        
-        # Ensure both audios are the same length
-        min_len = min(len(clean_audio), len(noise_audio))
-        clean_audio = clean_audio[:min_len]
-        noise_audio = noise_audio[:min_len]
-        
-        # Mix clean and noisy audio
-        noisy_audio = clean_audio + noise_audio * np.sqrt(np.sum(clean_audio**2) / (np.sum(noise_audio**2) * 10**(snr/10)))
-        
-        # Convert to spectrograms
-        clean_spec = audio_to_spectrogram(clean_audio)
-        noisy_spec = audio_to_spectrogram(noisy_audio)
-        
-        # Truncate or pad spectrograms to fixed length
-        if clean_spec.shape[1] > fixed_length:
-            clean_spec = clean_spec[:, :fixed_length]
-            noisy_spec = noisy_spec[:, :fixed_length]
-        elif clean_spec.shape[1] < fixed_length:
-            pad_width = fixed_length - clean_spec.shape[1]
-            clean_spec = np.pad(clean_spec, ((0, 0), (0, pad_width)), mode='constant')
-            noisy_spec = np.pad(noisy_spec, ((0, 0), (0, pad_width)), mode='constant')
-        
-        X.append(noisy_spec.T)  # Transpose to (time_steps, n_features)
-        y.append(clean_spec.T)
+        # Ensure both audios have the same length
+        min_length = min(len(clean_audio), len(noise_audio))
+        clean_audio = clean_audio[:min_length]
+        noise_audio = noise_audio[:min_length]
+
+        # Optionally truncate or pad to a target length
+        if self.target_length is not None:
+            if min_length < self.target_length:
+                # Pad with zeros if shorter than target length
+                clean_audio = np.pad(clean_audio, (0, self.target_length - min_length), mode='constant')
+                noise_audio = np.pad(noise_audio, (0, self.target_length - min_length), mode='constant')
+            else:
+                # Truncate if longer than target length
+                clean_audio = clean_audio[:self.target_length]
+                noise_audio = noise_audio[:self.target_length]
+
+        # Add noise to the clean audio
+        noisy_audio = clean_audio + 0.5 * noise_audio
+
+        # Convert to tensors
+        clean_tensor = torch.tensor(clean_audio, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
+        noisy_tensor = torch.tensor(noisy_audio, dtype=torch.float32).unsqueeze(0)
+
+        # Apply any transformations (e.g., scaling, normalization)
+        if self.transform:
+            clean_tensor = self.transform(clean_tensor)
+            noisy_tensor = self.transform(noisy_tensor)
+
+        return noisy_tensor, clean_tensor
+
+def collate_fn(batch):
+    noisy_data = [item[0] for item in batch]
+    clean_data = [item[1] for item in batch]
     
-    return np.array(X), np.array(y)
-
-
-def main():
-    # Load dataset
-    clean_files = []
-    for root, dirs, files in os.walk("data/clean"):
-        for file in files:
-            if file.endswith((".wav",".mp3",".flac")):
-                clean_files.append(os.path.join(root, file))
-
+    # Pad sequences to the same length
+    noisy_data = torch.nn.utils.rnn.pad_sequence(noisy_data, batch_first=True)
+    clean_data = torch.nn.utils.rnn.pad_sequence(clean_data, batch_first=True)
     
-    noise_files = [os.path.join("data/noise", f) for f in os.listdir("data/noise") if f.endswith((".wav","mp3","flac"))]
-    """
-    //ill be adding that if the noise dir has sub dirs that contain the wanted files
-    noise_files = []
-    for root, dirs, files in os.walk("data/noise"):
-        for file in files:
+    return noisy_data, clean_data
+
+# Define the model, loss, and optimizer
+input_channels = 1  # Mono audio
+model = DenoisNet(input_channels)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+# Hyperparameters
+batch_size = 8
+learning_rate = 1e-3
+epochs = 20
+
+# Prepare the dataset and dataloaders
+clean_files = []
+for root, dirs, files in os.walk("data/clean"):
+    for file in files:
+        if file.endswith((".wav",".mp3",".flac")):
             clean_files.append(os.path.join(root, file))
-    """
-    # Prepare dataset
-    X, y = prepare_dataset(clean_files, noise_files)
-    
-    # Split into train and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    # Build model or Load a saved one
-    try:
-        model = tf.keras.models.load_model("denoisnet.h5", compile=True)
-        print("Loading a saved model...")
-    except:
-        print("No saved model was found . Building a new one...")
-        model = denoisnet_model(input_shape=INPUT_SHAPE)
 
-    
-    model.compile(optimizer='adam', loss='mse')
-    
-    # Train model
-    model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE
-    )
-    
-    # Save model
-    model.save("denoisnet.h5", save_format="h5")
+noise_files = [os.path.join("data/noise", f) for f in os.listdir("data/noise") if f.endswith((".wav","mp3","flac"))]
 
-if __name__ == "__main__":
-    main()
+target_length = 55128  # Divisible by 8 (2^3)
+train_dataset = AudioDataset(clean_files, noise_files, target_length=target_length)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
+# Loss and optimizer
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Training loop
+for epoch in range(epochs):
+    model.train()  # Set the model to training mode
+    running_loss = 0.0
+
+    for noisy_data, clean_data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch"):
+        noisy_data, clean_data = noisy_data.to(device), clean_data.to(device)
+
+        # Zero the gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        output = model(noisy_data)
+
+        # Compute the loss
+        loss = criterion(output, clean_data)
+
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    # Print loss for this epoch
+    avg_loss = running_loss / len(train_loader)
+    print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+
+    # Optionally save the model checkpoint
+    torch.save(model.state_dict(), f"denoise_model_epoch_{epoch+1}.pth")
+
+# After training, you can save the model
+torch.save(model.state_dict(), "denoise_model_final.pth")
+print("Training complete. Model saved.")
