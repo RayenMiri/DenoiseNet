@@ -62,7 +62,7 @@ class NoiseSuppressionTester:
                       channels=1,
                       blocksize=self.buffer_size):
             while True:
-                time.sleep(0.1)
+                time.sleep(0.01)
 
     def _process_chunk(self, audio):
         """Process a single audio chunk"""

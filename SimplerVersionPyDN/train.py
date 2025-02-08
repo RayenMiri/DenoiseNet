@@ -38,7 +38,7 @@ def train_model():
     # Check for existing checkpoint
     if os.path.exists(config['model_save_path']):
         print(f"Loading existing checkpoint: {config['model_save_path']}")
-        checkpoint = torch.load(config['model_save_path'], map_location=device)
+        checkpoint = torch.load(config['model_save_path'], map_location=device,weights_only=False)
         
         # Load model and optimizer states
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -57,8 +57,8 @@ def train_model():
 
     # Dataset and DataLoader
     full_dataset = NoiseDataset(
-        clean_dir=os.path.join(config['data_dir'], 'clean_testset_wav'),
-        noise_dir=os.path.join(config['data_dir'], 'noisy_testset_wav'),
+        clean_dir=os.path.join(config['data_dir'], 'clean_trainset_28spk_wav'),
+        noise_dir=os.path.join(config['data_dir'], 'noisy_trainset_28spk_wav'),
         sr=16000,
         segment_length=16000
     )
